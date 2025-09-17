@@ -1,0 +1,5 @@
+name: iptables_manager_pro
+author: Cinrrs
+description: 通过SSH管理iptables，带审批、端口检测、IP白名单。
+version: 2.0.0
+repo_url: https://github.com/Inrrs/astrbot-framework-plugin
