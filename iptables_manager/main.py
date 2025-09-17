@@ -221,68 +221,12 @@ class IptablesManagerProPlugin(Star):
     # ===================================================================
     # --- 管理员指令 (需要ADMIN权限) ---
     # ===================================================================
-    async def _check_and_setup_remote_host(self, event: AstrMessageEvent):
-        """检查并配置远程主机环境，包括iptables和IP转发。"""
-        try:
-            # 1. 检查并尝试安装 iptables
-            yield event.plain_result("1/3: 正在检查远程主机 iptables 是否可用...")
-            try:
-                await self._run_ssh_command("command -v iptables")
-                yield event.plain_result("✅ iptables 已安装。")
-            except IOError:
-                yield event.plain_result("⚠️ 未找到 iptables 命令，正在尝试自动安装...")
-                try:
-                    # 智能检测包管理器并安装
-                    install_script = (
-                        "if command -v apt-get > /dev/null; then "
-                        "apt-get update && apt-get install -y iptables; "
-                        "elif command -v yum > /dev/null; then "
-                        "yum install -y iptables; "
-                        "elif command -v dnf > /dev/null; then "
-                        "dnf install -y iptables; "
-                        "else "
-                        "echo 'Unsupported package manager.' >&2; exit 1; "
-                        "fi"
-                    )
-                    install_result = await self._run_ssh_command(install_script)
-                    yield event.plain_result(f"✅ iptables 自动安装成功。\n{install_result}")
-                except Exception as install_e:
-                    yield event.plain_result(f"❌ iptables 自动安装失败: {install_e}\n请在远程主机上手动安装 iptables 相关工具包，然后重试。")
-                    return  # 安装失败，中止后续步骤
-
-            # 2. 检查 IP 转发状态
-            yield event.plain_result("\n2/3: 正在检查 IP 转发状态...")
-            runtime_check = await self._run_ssh_command("sysctl net.ipv4.ip_forward")
-            if "net.ipv4.ip_forward = 1" in runtime_check:
-                yield event.plain_result("✅ IP 转发在当前运行时已开启。")
-            else:
-                yield event.plain_result("⚠️ IP 转发在当前运行时未开启。")
-
-            # 3. 检查并设置永久 IP 转发
-            yield event.plain_result("\n3/3: 正在检查 IP 转发是否已永久启用...")
-            permanent_check_command = "grep -q '^\\s*net.ipv4.ip_forward\\s*=\\s*1' /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null"
-            
-            try:
-                await self._run_ssh_command(f"bash -c '{permanent_check_command}'")
-                yield event.plain_result("✅ IP 转发已永久启用。")
-            except IOError:
-                yield event.plain_result("⚠️ IP 转发未永久启用，正在尝试自动配置...")
-                enable_command = (
-                    "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-astrbot-forward.conf && "
-                    "sysctl -p /etc/sysctl.d/99-astrbot-forward.conf"
-                )
-                enable_result = await self._run_ssh_command(enable_command)
-                yield event.plain_result(f"✅ 永久启用 IP 转发成功。\n{enable_result}")
-            
-            yield event.plain_result("\n远程主机环境检查和配置完成。")
-
-        except Exception as e:
-            yield event.plain_result(f"❌ 环境检查时发生未知错误: {e}")
-
     @filter.permission_type(filter.PermissionType.ADMIN)
     @iptables_group.command("设置主机")
     async def set_host(self, event: AstrMessageEvent, host_str: str, username: str, password: str):
         """设置转发主机信息，并自动检查和配置远程环境。用法: /端口映射 设置主机 <ip[:端口]> <用户名> <密码>"""
+        
+        # --- Step 0: Configure Host Info ---
         async with self.lock:
             if ":" in host_str:
                 host, port_str = host_str.split(":", 1)
@@ -301,12 +245,71 @@ class IptablesManagerProPlugin(Star):
             self.config["password"] = password
             save_data(CONFIG_FILE, self.config)
         
-        yield event.plain_result(f"主机信息设置成功：\nIP: {host}\n端口: {port}\n用户名: {username}")
-        yield event.plain_result("\n开始自动检查和配置远程主机环境...")
+        # --- Step 1: Run all checks and collect logs ---
+        log_messages = [
+            f"主机信息设置成功：\nIP: {host}\n端口: {port}\n用户名: {username}",
+            "\n开始自动检查和配置远程主机环境..."
+        ]
+
+        try:
+            # Check 1: iptables
+            log_messages.append("1/3: 正在检查远程主机 iptables 是否可用...")
+            try:
+                await self._run_ssh_command("iptables -V")
+                log_messages.append("✅ iptables 已安装。")
+            except IOError:
+                log_messages.append("⚠️ 未找到 iptables 命令，正在尝试自动安装... (这可能需要几分钟，请耐心等待)")
+                try:
+                    install_script = (
+                        "if command -v apt-get > /dev/null; then "
+                        "apt-get update && apt-get install -y iptables; "
+                        "elif command -v yum > /dev/null; then "
+                        "yum install -y iptables; "
+                        "elif command -v dnf > /dev/null; then "
+                        "dnf install -y iptables; "
+                        "else "
+                        "echo 'Unsupported package manager.' >&2; exit 1; "
+                        "fi"
+                    )
+                    install_result = await self._run_ssh_command(install_script)
+                    log_messages.append(f"✅ iptables 自动安装成功。\n{install_result}")
+                except Exception as install_e:
+                    log_messages.append(f"❌ iptables 自动安装失败: {install_e}\n请在远程主机上手动安装 iptables 相关工具包，然后重试。")
+                    yield event.plain_result("\n".join(log_messages))
+                    return
+
+            # Check 2: IP Forwarding (Runtime)
+            log_messages.append("\n2/3: 正在检查 IP 转发状态...")
+            runtime_check = await self._run_ssh_command("sysctl net.ipv4.ip_forward")
+            if "net.ipv4.ip_forward = 1" in runtime_check:
+                log_messages.append("✅ IP 转发在当前运行时已开启。")
+            else:
+                log_messages.append("⚠️ IP 转发在当前运行时未开启，正在临时启用...")
+                await self._run_ssh_command("sysctl -w net.ipv4.ip_forward=1")
+
+            # Check 3: IP Forwarding (Permanent)
+            log_messages.append("\n3/3: 正在检查 IP 转发是否已永久启用...")
+            permanent_check_command = "grep -q '^\\s*net.ipv4.ip_forward\\s*=\\s*1' /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null"
+            
+            try:
+                await self._run_ssh_command(f"bash -c '{permanent_check_command}'")
+                log_messages.append("✅ IP 转发已永久启用。")
+            except IOError:
+                log_messages.append("⚠️ IP 转发未永久启用，正在尝试自动配置...")
+                enable_command = (
+                    "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-astrbot-forward.conf && "
+                    "sysctl -p /etc/sysctl.d/99-astrbot-forward.conf"
+                )
+                enable_result = await self._run_ssh_command(enable_command)
+                log_messages.append(f"✅ 永久启用 IP 转发成功。\n{enable_result}")
+            
+            log_messages.append("\n远程主机环境检查和配置完成。")
+
+        except Exception as e:
+            log_messages.append(f"❌ 环境检查时发生未知错误: {e}")
         
-        # 调用新的检查和设置函数
-        async for message in self._check_and_setup_remote_host(event):
-            yield message
+        # --- Step 2: Send the final consolidated report ---
+        yield event.plain_result("\n".join(log_messages))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @iptables_group.command("查看主机")
