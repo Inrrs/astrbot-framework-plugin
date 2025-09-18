@@ -1,0 +1,5 @@
+name: openresty_proxy_manager
+author: 781899414
+description: 通过SSH管理OpenResty反向代理，带审批、域名白名单。
+version: 1.0.0
+repo_url: https://github.com/Inrrs/astrbot-framework-plugin

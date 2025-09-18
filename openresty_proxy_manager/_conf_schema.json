@@ -1,0 +1,66 @@
+{
+  "ssh_config": {
+    "description": "用于连接到 OpenResty 服务器的 SSH 设置。",
+    "type": "object",
+    "items": {
+      "host": {
+        "description": "SSH 主机或 IP 地址。",
+        "type": "string"
+      },
+      "port": {
+        "description": "SSH 端口。",
+        "type": "int",
+        "default": 22
+      },
+      "username": {
+        "description": "SSH 用户名。",
+        "type": "string"
+      },
+      "password": {
+        "description": "SSH 密码。",
+        "type": "string"
+      }
+    }
+  },
+  "openresty_config": {
+    "description": "OpenResty 的配置设置。",
+    "type": "object",
+    "items": {
+      "main_domain": {
+        "description": "服务器的主域名，用于 HTTPS 证书匹配。",
+        "type": "string"
+      },
+      "remote_http_config_path": {
+        "description": "HTTP 代理配置文件的远程路径。",
+        "type": "string"
+      },
+      "remote_stream_config_path": {
+        "description": "Stream (TCP/UDP) 代理配置文件的远程路径。",
+        "type": "string"
+      },
+      "ssl_cert_path": {
+        "description": "包含 SSL 证书的目录的远程路径。",
+        "type": "string"
+      }
+    }
+  },
+  "approvers": {
+    "description": "可以批准代理请求的用户 ID 列表。",
+    "type": "list",
+    "default": []
+  },
+  "requests": {
+    "description": "代理请求的存储。由插件管理。",
+    "type": "object",
+    "default": {},
+    "invisible": true,
+    "items": {}
+  },
+  "whitelist": {
+    "description": "可以被代理的内部 IP 白名单。由插件管理。",
+    "type": "object",
+    "default": {},
+    "invisible": true,
+    "items": {}
+  }
+}
