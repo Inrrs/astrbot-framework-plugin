@@ -1,12 +1,15 @@
 import asyncio
 import json
+import random
 import re
 import asyncssh
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+from contextlib import asynccontextmanager
+from jinja2 import Environment, FileSystemLoader
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
@@ -21,11 +24,15 @@ class OpenRestyProxyManagerPlugin(Star):
         else:
             self.config = config
 
+        # 初始化 Jinja2 环境
+        template_dir = Path(__file__).parent / "templates"
+        self.jinja_env = Environment(loader=FileSystemLoader(template_dir), autoescape=False)
+
         # 使用独立文件进行数据持久化
         self.data_path = Path(__file__).parent / "data.json"
         self.requests = {}
         self.whitelist = {}
-        self.forbidden_ports = {80, 443, 8080, 8443}  # 禁止反代的端口
+        self.forbidden_ports = set()  # 在 initialize 中加载
         self.lock = asyncio.Lock()
         asyncio.create_task(self.initialize())
 
@@ -54,12 +61,50 @@ class OpenRestyProxyManagerPlugin(Star):
             self.whitelist = data.get("whitelist", {})
             if "ips" not in self.whitelist:
                 self.whitelist["ips"] = []
+            
+            await self._load_forbidden_ports_from_file()
             logger.info("OpenResty Proxy Manager 插件已加载，并从 data.json 恢复了数据。")
+
+    async def _load_forbidden_ports_from_file(self):
+        """从 forbidden_ports.txt 加载额外的禁用端口"""
+        static_ports = {80, 443, 8080, 8443}
+        file_ports = set()
+        
+        # The new file is in the same directory as the script
+        forbidden_ports_path = Path(__file__).parent / "forbidden_ports.txt"
+        
+        if not forbidden_ports_path.exists():
+            try:
+                with open(forbidden_ports_path, 'w', encoding='utf-8') as f:
+                    f.write("# 在此文件中添加需要禁用的端口或端口范围。\n")
+                    f.write("# 每行一个端口或一个范围 (例如 10000-10010)。\n")
+                    f.write("# 以 # 号开头的行为注释。\n")
+                logger.info(f"已创建 'forbidden_ports.txt' 文件。")
+            except Exception as e:
+                logger.error(f"创建 forbidden_ports.txt 文件时出错: {e}")
+        
+        try:
+            with open(forbidden_ports_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'): # ignore empty lines and comments
+                        continue
+                    if '-' in line:
+                        start, end = map(int, line.split('-'))
+                        file_ports.update(range(start, end + 1))
+                    else:
+                        file_ports.add(int(line))
+        except Exception as e:
+            logger.error(f"读取或解析 forbidden_ports.txt 时出错: {e}")
+
+        self.forbidden_ports = static_ports.union(file_ports)
+        logger.info(f"加载了 {len(self.forbidden_ports)} 个禁用端口 (静态: {len(static_ports)}, 文件: {len(file_ports)})")
 
     # --- 核心辅助函数 ---
 
-    async def _run_ssh_command(self, command: str):
-        """使用 asyncssh 执行远程 SSH 命令"""
+    @asynccontextmanager
+    async def _ssh_connection(self):
+        """提供一个安全的 asyncssh 连接上下文。"""
         ssh_config = self.config.get("ssh_config", {})
         host = ssh_config.get("host")
         port = ssh_config.get("port")
@@ -69,18 +114,30 @@ class OpenRestyProxyManagerPlugin(Star):
         if not all([host, username, password]):
             raise ValueError("SSH主机信息未在插件配置中完全配置。")
 
+        conn = None
         try:
-            async with asyncssh.connect(
+            conn = await asyncssh.connect(
                 host,
                 port=port,
                 username=username,
                 password=password,
                 known_hosts=None
-            ) as conn:
+            )
+            yield conn
+        except asyncssh.Error as e:
+            raise IOError(f"SSH连接失败: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    async def _run_ssh_command(self, command: str):
+        """使用 asyncssh 执行远程 SSH 命令"""
+        try:
+            async with self._ssh_connection() as conn:
                 result = await conn.run(f"sudo {command}", check=True)
                 return result.stdout.strip() if result.stdout else ""
         except asyncssh.Error as e:
-            raise IOError(f"SSH连接或命令执行失败: {e}")
+            raise IOError(f"SSH命令执行失败: {e}")
         except Exception as e:
             raise IOError(f"执行SSH命令时发生未知错误: {e}")
 
@@ -90,14 +147,14 @@ class OpenRestyProxyManagerPlugin(Star):
         ssl_path = openresty_config.get("ssl_cert_path")
         if not ssl_path:
             raise ValueError("SSL证书路径未配置。")
-            
+
         cert_path = f"{ssl_path}{cert_name}.pem"
         key_path = f"{ssl_path}{cert_name}.key"
-        
+
         command = f"[ -f {cert_path} ] && [ -f {key_path} ]"
         try:
-            await self._run_ssh_command(command)
-            return True
+            # 使用 _run_ssh_command_and_get_code 避免在文件不存在时抛出 check=True 异常
+            return await self._run_ssh_command_and_get_code(command) == 0
         except IOError:
             return False
 
@@ -120,7 +177,8 @@ class OpenRestyProxyManagerPlugin(Star):
         if not user_context or "unified_msg_origin" not in user_context:
             return
         try:
-            await self.context.send_plain_message(user_context["unified_msg_origin"], message)
+            chain = MessageChain().message(message)
+            await self.context.send_message(user_context["unified_msg_origin"], chain)
         except Exception as e:
             logger.error(f"通知用户失败: {e}")
 
@@ -129,95 +187,55 @@ class OpenRestyProxyManagerPlugin(Star):
         approved_requests = [(rid, req) for rid, req in self.requests.items() if req.get("status") == "approved"]
         openresty_config = self.config.get("openresty_config", {})
 
-        http_rules, stream_rules = [], []
+        # 准备模板所需的数据
+        http_rules_data, stream_rules_data = [], []
+        processed_stream_params = set()
+
         for rid, req in approved_requests:
             protocol = req.get("protocol", "http")
-            if protocol in ["http", "https"]:
-                http_rules.append((rid, req))
-            elif protocol in ["tcp", "udp"]:
-                if not any(r[1]['params'] == req['params'] for r in stream_rules):
-                    stream_rules.append((rid, req))
-        
-        main_domain = openresty_config.get("main_domain") or "_"
-        ssl_cert_path = openresty_config.get("ssl_cert_path")
-        
-        http_config_lines = ["# Auto-generated by AstrBot. Do not edit manually."]
-        if http_rules:
-            for rid, req in http_rules:
-                applicant_name = req.get('request_event', {}).get('sender', {}).get('name', 'N/A')
-                remark = req.get('remark', 'N/A')
-                protocol, (lan_address, wan_port) = req.get("protocol", "http"), req['params'].split()
-                proxy_pass = f"http://{lan_address}"
-                
-                comment = f"# Rule ID: {rid} | Applicant: {applicant_name} | Purpose: {remark}"
+            lan_address, wan_port = req['params'].split()
+            
+            rule_data = {
+                "rid": rid,
+                "applicant_name": req.get('request_event', {}).get('sender', {}).get('name', 'N/A'),
+                "remark": req.get('remark', 'N/A'),
+                "protocol": protocol,
+                "lan_address": lan_address,
+                "wan_port": wan_port,
+                "cert_name": req.get("cert_name")
+            }
 
-                if protocol == "https":
-                    cert_name = req.get("cert_name")
-                    if not cert_name or not ssl_cert_path: continue
-                    http_config_lines.append(f"""
-{comment}
-server {{
-    listen {wan_port} ssl http2;
-    server_name {main_domain};
-    ssl_certificate {ssl_cert_path}{cert_name}.pem;
-    ssl_certificate_key {ssl_cert_path}{cert_name}.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    location / {{
-        proxy_pass {proxy_pass};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }}
-}}""")
-                else:
-                    http_config_lines.append(f"""
-{comment}
-server {{
-    listen {wan_port};
-    server_name {main_domain};
-    location / {{
-        proxy_pass {proxy_pass};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }}
-}}""")
-        
+            if protocol in ["http", "https"]:
+                http_rules_data.append(rule_data)
+            elif protocol in ["tcp", "udp"]:
+                # 去重，避免为同一个TCP/UDP请求生成重复的stream配置块
+                if req['params'] not in processed_stream_params:
+                    stream_rules_data.append(rule_data)
+                    processed_stream_params.add(req['params'])
+
+        # 渲染 HTTP 配置
+        http_template = self.jinja_env.get_template("http.conf.j2")
+        http_config_content = http_template.render(
+            http_rules=http_rules_data,
+            main_domain=openresty_config.get("main_domain") or "_",
+            ssl_cert_path=openresty_config.get("ssl_cert_path")
+        )
         await self._upload_and_reload(
-            "\n".join(http_config_lines), 
+            http_config_content,
             openresty_config.get("remote_http_config_path"),
             is_stream=False
         )
 
-        stream_config_lines = ["# Auto-generated by AstrBot. Do not edit manually."]
-        if stream_rules:
-            for rid, req in stream_rules:
-                applicant_name = req.get('request_event', {}).get('sender', {}).get('name', 'N/A')
-                remark = req.get('remark', 'N/A')
-                comment = f"# Rule ID: {rid} | Applicant: {applicant_name} | Purpose: {remark}"
-                lan_address, wan_port = req['params'].split()
-                stream_config_lines.extend([f"""
-{comment}
-server {{
-    listen {wan_port};
-    proxy_pass {lan_address};
-}}""", f"""
-{comment} (UDP)
-server {{
-    listen {wan_port} udp;
-    proxy_pass {lan_address};
-}}"""])
-
+        # 渲染 Stream 配置
+        stream_template = self.jinja_env.get_template("stream.conf.j2")
+        stream_config_content = stream_template.render(stream_rules=stream_rules_data)
         await self._upload_and_reload(
-            "\n".join(stream_config_lines), 
+            stream_config_content,
             openresty_config.get("remote_stream_config_path"),
             is_stream=True
         )
 
-        return f"OpenResty配置已更新: {len(http_rules)}条HTTP/S规则, {len(stream_rules)}条TCP/UDP规则。"
+        return f"OpenResty配置已更新: {len(http_rules_data)}条HTTP/S规则, {len(stream_rules_data)}条TCP/UDP规则。"
 
     async def _upload_and_reload(self, config_content: str, remote_path: str, is_stream: bool):
         """安全地上传配置、测试，然后重载 OpenResty。"""
@@ -235,11 +253,7 @@ server {{
         temp_path = f"/tmp/astrabot_conf_{int(time.time())}_{hash(config_content) & 0xffffff}"
         logger.info(f"使用临时文件: {temp_path}")
 
-        ssh_details = self.config.get("ssh_config", {})
-        if not ssh_details.get("host"):
-            raise ValueError("SSH主机信息未配置。")
-
-        async with asyncssh.connect(**ssh_details, known_hosts=None) as conn:
+        async with self._ssh_connection() as conn:
             try:
                 logger.info(f"步骤 1/8: 上传配置到临时文件 {temp_path}...")
                 async with conn.start_sftp_client() as sftp:
@@ -313,41 +327,19 @@ server {{
     # ===================================================================
     async def _run_ssh_command_full_output(self, command: str):
         """使用 asyncssh 执行远程 SSH 命令并返回 stdout 和 stderr。"""
-        ssh_config = self.config.get("ssh_config", {})
-        host = ssh_config.get("host")
-        port = ssh_config.get("port")
-        username = ssh_config.get("username")
-        password = ssh_config.get("password")
-
-        if not all([host, username, password]):
-            raise ValueError("SSH主机信息未在插件配置中完全配置。")
-
         try:
-            async with asyncssh.connect(
-                host, port=port, username=username, password=password, known_hosts=None
-            ) as conn:
+            async with self._ssh_connection() as conn:
                 result = await conn.run(f"sudo {command}", check=False)
                 return (result.stdout or "", result.stderr or "")
         except asyncssh.Error as e:
-            raise IOError(f"SSH连接或命令执行失败: {e}")
+            raise IOError(f"SSH命令执行失败: {e}")
         except Exception as e:
             raise IOError(f"执行SSH命令时发生未知错误: {e}")
 
     async def _run_ssh_command_and_get_code(self, command: str):
         """使用 asyncssh 执行远程 SSH 命令并返回退出码。"""
-        ssh_config = self.config.get("ssh_config", {})
-        host = ssh_config.get("host")
-        port = ssh_config.get("port")
-        username = ssh_config.get("username")
-        password = ssh_config.get("password")
-
-        if not all([host, username, password]):
-            raise ValueError("SSH主机信息未在插件配置中完全配置。")
-
         try:
-            async with asyncssh.connect(
-                host, port=port, username=username, password=password, known_hosts=None
-            ) as conn:
+            async with self._ssh_connection() as conn:
                 result = await conn.run(f"sudo {command}", check=False)
                 return result.returncode
         except (asyncssh.Error, IOError, Exception) as e:
@@ -468,79 +460,51 @@ server {{
         )
         yield event.plain_result(config_str)
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @proxy_group.command("添加审批员")
-    async def add_approver(self, event: AstrMessageEvent, approver_id=None):
-        """添加审批员。"""
-        if not approver_id:
-            yield event.plain_result("用法: /反代 添加审批员 <审批员QQ号>")
-            return
-        async with self.lock:
-            approvers = self.config.get("approvers", [])
-            if approver_id in approvers:
-                yield event.plain_result(f"审批员 {approver_id} 已存在，无需重复添加。")
-                return
-
-            approvers.append(approver_id)
-            self.config["approvers"] = approvers
-            self.config.save_config()
-        yield event.plain_result(f"审批员 {approver_id} 添加成功。现在也可以在WebUI中看到更新。")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @proxy_group.command("删除审批员")
-    async def remove_approver(self, event: AstrMessageEvent, approver_id=None):
-        """删除审批员。"""
-        if not approver_id:
-            yield event.plain_result("用法: /反代 删除审批员 <审批员QQ号>")
-            return
-        async with self.lock:
-            approvers = self.config.get("approvers", [])
-            if approver_id not in approvers:
-                yield event.plain_result(f"审批员 {approver_id} 不在列表中。")
-                return
-
-            approvers.remove(approver_id)
-            self.config["approvers"] = approvers
-            self.config.save_config()
-        yield event.plain_result(f"审批员 {approver_id} 已从列表中移除。")
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @proxy_group.command("查看审批员")
-    async def view_approvers(self, event: AstrMessageEvent):
-        """查看当前的审批员列表。"""
-        approvers = self.config.get("approvers", [])
-        if not approvers:
-            yield event.plain_result("当前没有设置审批员。")
-            return
-        
-        approver_list_str = "\n".join([f"- {aid}" for aid in approvers])
-        yield event.plain_result("当前审批员列表：\n" + approver_list_str)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @proxy_group.command("白名单添加")
     async def whitelist_add(self, event: AstrMessageEvent, ips_str=None):
-        """向IP白名单中添加一个或多个IP地址，使用空格分隔。"""
+        """向IP白名单中添加一个或多个IP地址，使用空格分隔。按顺序处理，跳过重复项。"""
         if not ips_str:
             yield event.plain_result("用法: /反代 白名单添加 <IP地址1> [IP地址2]...\n多个IP请用空格分隔。")
             return
-        ips = ips_str.strip().split()
-
+        
+        # 使用列表以保留输入顺序
+        input_ips = ips_str.strip().split()
+        
+        newly_added = []
+        skipped = []
+        
         async with self.lock:
             ip_list = self.whitelist.get("ips", [])
-            added, existed = [], []
-            for ip in ips:
-                if ip not in ip_list:
-                    ip_list.append(ip)
-                    added.append(ip)
-                else:
-                    existed.append(ip)
-            
-            self.whitelist["ips"] = ip_list
-            await self._save_data()
+            # 创建一个集合用于高效查找已存在的和本次新添加的IP
+            master_ip_set = set(ip_list)
 
-        reply_msg = ""
-        if added: reply_msg += f"成功添加IP: {', '.join(added)}\n"
-        if existed: reply_msg += f"IP已存在，未重复添加: {', '.join(existed)}\n"
+            for ip in input_ips:
+                if ip in master_ip_set:
+                    if ip not in skipped:
+                        skipped.append(ip)
+                else:
+                    newly_added.append(ip)
+                    master_ip_set.add(ip) # 将新IP添加到集合中，以处理输入列表内的重复项
+
+            if newly_added:
+                ip_list.extend(newly_added)
+                self.whitelist["ips"] = ip_list # 保留原始顺序，并将新IP附加到末尾
+                await self._save_data()
+
+        # 构建并发送回复消息
+        reply_parts = []
+        if newly_added:
+            reply_parts.append(f"成功添加IP: {', '.join(newly_added)}")
+        if skipped:
+            reply_parts.append(f"IP已存在，已跳过: {', '.join(skipped)}")
+        
+        if not reply_parts:
+            reply_msg = "没有新的IP被添加，或所有提供的IP都已存在。"
+        else:
+            reply_msg = "\n".join(reply_parts)
+            
         yield event.plain_result(reply_msg.strip())
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -576,6 +540,59 @@ server {{
         """查看IP白名单。"""
         ip_list = self.whitelist.get("ips", [])
         yield event.plain_result("内网IP白名单：\n" + "\n".join(ip_list) if ip_list else "白名单为空。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @proxy_group.command("禁用")
+    async def forbid_ports(self, event: AstrMessageEvent, sub_command: str = "", ports_str: str = None):
+        """管理禁止反代的端口。用法: /反代 禁用 端口 <端口1> [端口2]..."""
+        if sub_command != "端口" or not ports_str:
+            yield event.plain_result("用法: /反代 禁用 端口 <端口1> [端口2]...")
+            return
+
+        try:
+            ports_to_forbid = {int(p) for p in ports_str.strip().split()}
+        except ValueError:
+            yield event.plain_result("错误：所有端口都必须是有效的数字。")
+            return
+
+        async with self.lock:
+            # Check for conflicts with existing approved rules
+            conflicts = []
+            for port in ports_to_forbid:
+                occupying_req = await self._get_occupying_request(port)
+                if occupying_req:
+                    applicant_name = occupying_req.get('request_event', {}).get('sender', {}).get('name', 'N/A')
+                    conflicts.append(f"端口 {port} 已被 {applicant_name} 的规则占用。")
+
+            if conflicts:
+                yield event.plain_result("操作失败，以下端口正在使用中：\n" + "\n".join(conflicts))
+                return
+
+            # Check for duplicates already in the full forbidden list
+            added = sorted(list(ports_to_forbid - self.forbidden_ports))
+            skipped = sorted(list(ports_to_forbid & self.forbidden_ports))
+
+            if added:
+                forbidden_ports_path = Path(__file__).parent / "forbidden_ports.txt"
+                try:
+                    with open(forbidden_ports_path, 'a', encoding='utf-8') as f:
+                        f.write(f"\n# Added by admin on {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        for port in added:
+                            f.write(f"{port}\n")
+                except Exception as e:
+                    logger.error(f"写入 forbidden_ports.txt 时出错: {e}")
+                    yield event.plain_result("错误：无法写入 forbidden_ports.txt 文件。")
+                    return
+                
+                # Update the in-memory set directly instead of re-reading the file
+                self.forbidden_ports.update(added)
+                logger.info(f"已将 {len(added)} 个新端口添加到禁用列表并写入文件。")
+
+            reply_msg = ""
+            if added: reply_msg += f"成功禁用端口并写入文件: {', '.join(map(str, added))}\n"
+            if skipped: reply_msg += f"端口已在禁用列表中，已跳过: {', '.join(map(str, skipped))}\n"
+            if not reply_msg: reply_msg = "没有新的端口被禁用。"
+            yield event.plain_result(reply_msg.strip())
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @proxy_group.command("审批")
@@ -665,20 +682,37 @@ server {{
 
                     req['status'] = "approved"
                     results_log.append(f"✅ ID {req_id}: 已批准。")
-                    approved_reqs_info.append((req['request_event'], req_id))
+                    approved_reqs_info.append((req['request_event'], req_id, req))
                     success_count += 1
 
                 except Exception as e:
                     results_log.append(f"❌ ID {req_id}: 处理时发生内部错误: {e}")
                     failure_count += 1
             
+            admin_notif_msg = (
+                f"管理员 {event.get_sender_name()} ({event.get_sender_id()}) 已处理审批申请。\n"
+                f"总数: {len(request_ids)}, 成功: {success_count}, 失败: {failure_count}\n"
+                "--- 处理日志 ---\n" + "\n".join(results_log)
+            )
+
             if success_count > 0:
                 yield event.plain_result(f"审批处理完成... 正在更新远程配置...\n" + "\n".join(results_log))
                 try:
                     await self._save_data()
                     result = await self._update_openresty_config()
-                    for req_event, req_id in approved_reqs_info:
-                        await self._notify_user(req_event, f"您的反向代理申请 {req_id} 已被管理员批准。")
+                    for req_event, req_id, req_data in approved_reqs_info:
+                        protocol = req_data.get("protocol")
+                        notification_message = f"您的反向代理申请 {req_id} 已被管理员批准。"
+                        
+                        if protocol in ["http", "https"]:
+                            openresty_config = self.config.get("openresty_config", {})
+                            main_domain = openresty_config.get("main_domain")
+                            if main_domain:
+                                _lan_address, wan_port = req_data['params'].split()
+                                access_url = f"{protocol}://{main_domain}:{wan_port}"
+                                notification_message += f"\n访问地址: {access_url}"
+
+                        await self._notify_user(req_event, notification_message)
                     yield event.plain_result(f"配置更新成功！\n{result}")
                 except Exception as e:
                     yield event.plain_result(f"配置更新失败: {e}\n部分申请状态可能已改变，但未生效。请检查并重试。")
@@ -718,7 +752,11 @@ server {{
 
             if rejected_count > 0:
                 await self._save_data()
-            
+                admin_notif_msg = (
+                    f"管理员 {event.get_sender_name()} ({event.get_sender_id()}) 已拒绝 {rejected_count} 个申请。\n"
+                    "--- 处理日志 ---\n" + "\n".join(results_log)
+                )
+
             yield event.plain_result(f"操作完成。共拒绝 {rejected_count} 个申请。\n" + "\n".join(results_log))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -773,7 +811,14 @@ server {{
 
             if matched_rules:
                 report += "✅ 正常生效的规则:\n"
-                for rule_params in sorted(list(matched_rules)):
+                def sort_key(rule_params):
+                    try:
+                        lan_ip_str = rule_params.split()[0].split(':')[0]
+                        return tuple(map(int, lan_ip_str.split('.')))
+                    except (IndexError, ValueError):
+                        return (0, 0, 0, 0)
+
+                for rule_params in sorted(list(matched_rules), key=sort_key):
                     rid, req = local_rules_map[rule_params]
                     applicant_id = req.get('request_event', {}).get('sender', {}).get('id', 'N/A')
                     remark = req.get('remark', '无')
@@ -790,15 +835,33 @@ server {{
                 for rule_params in sorted(list(inactive_rules)):
                     rid, req = local_rules_map[rule_params]
                     report += f"  - {rule_params} (ID: {rid})\n"
-                report += "   (建议使用 `/反代 删除 <ID>` 清理这些记录，或检查远程配置问题)\n"
 
             if not any([matched_rules, unknown_rules, inactive_rules]):
                 report += "系统干净，本地与远程均无生效的代理规则。"
+            
+            if unknown_rules or inactive_rules:
+                report += "\n\n---\n💡 检测到配置不一致。\n"
+                if inactive_rules:
+                    report += " - 要强制将本地规则同步到服务器，请使用: /反代 同步配置\n"
+                    report += " - 要清理无效的本地记录，请使用 '/反代 删除 <规则ID>'\n"
+                if unknown_rules:
+                    report += " - 要清理远程多余的未知规则，请使用 '/反代 删除 <端口号>'\n"
 
             yield event.plain_result(report)
 
         except Exception as e:
             yield event.plain_result(f"查看规则时发生错误: {e}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @proxy_group.command("同步配置")
+    async def sync_config(self, event: AstrMessageEvent):
+        """(管理员) 强制将本地存储的规则同步到远程服务器。"""
+        try:
+            yield event.plain_result("正在根据本地记录强制同步远程配置...")
+            result = await self._update_openresty_config()
+            yield event.plain_result(f"✅ 同步成功！\n{result}")
+        except Exception as e:
+            yield event.plain_result(f"❌ 同步失败: {e}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @proxy_group.command("添加")
@@ -880,40 +943,36 @@ server {{
             yield event.plain_result("用法: /反代 删除 <外网端口1 或 规则ID1> [外网端口2 或 规则ID2]...")
             return
 
-        identifiers = identifiers_str.strip().split()
+        identifiers = str(identifiers_str).strip().split()
         req_ids_to_delete = set()
-        not_found_identifiers = []
-        
+        found_input_identifiers = set()
+
         async with self.lock:
-            # 为已批准的规则创建一个临时的 端口 -> 规则ID 映射
-            port_to_req_id_map = {}
-            for rid, req in self.requests.items():
-                if req.get("status") == "approved":
+            # 首先，找到所有与给定标识符匹配的规则ID
+            for identifier in identifiers:
+                # 按完整的规则ID匹配
+                if identifier in self.requests:
+                    req_ids_to_delete.add(identifier)
+                    found_input_identifiers.add(identifier)
+                
+                # 按端口号匹配
+                for rid, req in self.requests.items():
                     try:
-                        wan_port = req['params'].split()[1]
-                        port_to_req_id_map[wan_port] = rid
+                        if 'params' in req and ' ' in req['params']:
+                            wan_port = req['params'].split()[1]
+                            if wan_port == identifier:
+                                req_ids_to_delete.add(rid)
+                                found_input_identifiers.add(identifier)
                     except (IndexError, KeyError):
                         continue
 
-            for identifier in identifiers:
-                found_req_id = None
-                # 1. 检查标识符是否为直接的规则ID
-                if identifier in self.requests and self.requests[identifier].get("status") == "approved":
-                    found_req_id = identifier
-                # 2. 检查标识符是否为端口号
-                elif identifier in port_to_req_id_map:
-                    found_req_id = port_to_req_id_map[identifier]
-                
-                if found_req_id:
-                    req_ids_to_delete.add(found_req_id)
-                else:
-                    not_found_identifiers.append(identifier)
+            not_found_identifiers = [i for i in identifiers if i not in found_input_identifiers]
 
             if not req_ids_to_delete:
-                yield event.plain_result(f"未在本地记录中找到与 '{identifiers_str}' 相关的已批准规则。")
+                yield event.plain_result(f"未在本地记录中找到与 '{identifiers_str}' 相关的任何规则。")
                 return
 
-            # 执行删除
+            # 然后，执行删除操作
             for req_id in req_ids_to_delete:
                 self.requests.pop(req_id, None)
             
@@ -921,7 +980,7 @@ server {{
 
         try:
             deleted_ids_str = ', '.join(sorted(list(req_ids_to_delete)))
-            yield event.plain_result(f"已从本地记录中标记删除规则: {deleted_ids_str}。\n正在更新远程配置...")
+            yield event.plain_result(f"已从本地记录中删除规则: {deleted_ids_str}。\n正在更新远程配置...")
             result = await self._update_openresty_config()
             
             final_report = f"✅ 操作成功。\n{result}\n"
@@ -937,6 +996,40 @@ server {{
     # ===================================================================
     # --- 用户指令 (所有用户可用) ---
     # ===================================================================
+    async def _recommend_ports(self, start_port: int) -> list[int]:
+        """
+        推荐一个可用端口。
+        优先向下查找3个端口，如果都不可用，则随机尝试20次。
+        """
+        # 1. Downward search
+        for i in range(1, 4):
+            port_to_check = start_port - i
+            if port_to_check <= 1024:  # Avoid well-known ports
+                break
+            
+            if port_to_check in self.forbidden_ports:
+                continue
+            if await self._get_occupying_request(port_to_check):
+                continue
+            if await self._is_remote_port_in_use(port_to_check):
+                continue
+            
+            return [port_to_check] # Found one, return immediately
+
+        # 2. Random search (fallback)
+        for _ in range(20): # Try 20 times
+            port_to_check = random.randint(1024, 65535)
+
+            if port_to_check in self.forbidden_ports:
+                continue
+            if await self._get_occupying_request(port_to_check):
+                continue
+            if await self._is_remote_port_in_use(port_to_check):
+                continue
+
+            return [port_to_check] # Found one, return immediately
+
+        return [] # Failed to find any port
     @proxy_group.command("申请")
     async def apply_proxy(self, event: AstrMessageEvent, protocol=None, lan_address=None, wan_port_str=None, remark=None):
         """申请反向代理。"""
@@ -946,7 +1039,9 @@ server {{
         try:
             wan_port = int(wan_port_str)
             if wan_port in self.forbidden_ports:
-                yield event.plain_result(f"申请失败：端口 {wan_port} 是被禁止使用的保留端口。")
+                recommendations = await self._recommend_ports(wan_port)
+                rec_str = f"推荐可用端口: {recommendations[0]}" if recommendations else "暂时没有可用的端口推荐。"
+                yield event.plain_result(f"申请失败：端口 {wan_port} 是被禁止使用的保留端口。\n{rec_str}")
                 return
         except ValueError:
             yield event.plain_result("端口号必须是一个有效的数字。")
@@ -973,11 +1068,15 @@ server {{
             occupying_request = await self._get_occupying_request(wan_port)
             if occupying_request:
                 applicant_name = occupying_request.get('request_event', {}).get('sender', {}).get('name', '未知申请人')
-                yield event.plain_result(f"申请失败：外网端口 {wan_port} 已被 {applicant_name} 的一个申请占用。")
+                recommendations = await self._recommend_ports(wan_port)
+                rec_str = f"推荐可用端口: {recommendations[0]}" if recommendations else "暂时没有可用的端口推荐。"
+                yield event.plain_result(f"申请失败：外网端口 {wan_port} 已被 {applicant_name} 的一个申请占用。\n{rec_str}")
                 return
 
             if await self._is_remote_port_in_use(wan_port):
-                yield event.plain_result(f"申请失败：外网端口 {wan_port} 已被系统或其他服务占用。")
+                recommendations = await self._recommend_ports(wan_port)
+                rec_str = f"推荐可用端口: {recommendations[0]}" if recommendations else "暂时没有可用的端口推荐。"
+                yield event.plain_result(f"申请失败：外网端口 {wan_port} 已被系统或其他服务占用。\n{rec_str}")
                 return
 
             request_id = f"{event.get_sender_id()}_{protocol}_{wan_port}"
@@ -1007,27 +1106,6 @@ server {{
             if protocol == "tcp":
                 reply_msg += "\n💡提示：TCP 申请将同时为您开启 UDP 端口的转发。"
             yield event.plain_result(reply_msg)
-            
-            approver_ids = self.config.get("approvers", [])
-            if approver_ids:
-                main_domain = openresty_config.get("main_domain", "未设置")
-                notif_msg = (
-                    f"收到新的 [{protocol.upper()}] 反向代理申请:\nID: {request_id}\n"
-                    f"申请人: {event.get_sender_name()} ({event.get_sender_id()})\n"
-                    f"内容: {main_domain}:{wan_port} -> {lan_address}\n"
-                    f"用途: {remark}\n"
-                )
-                if cert_name:
-                    notif_msg += f"证书名: {cert_name}\n"
-                notif_msg += f"请使用 '/反代 同意 {request_id}' 或 '/反代 拒绝 {request_id}' 处理。"
-                
-                platform_name = event.get_platform_name()
-                for admin_id in approver_ids:
-                    try:
-                        umo = f"{platform_name}:private:{admin_id}"
-                        await self.context.send_plain_message(umo, notif_msg)
-                    except Exception as e:
-                        logger.error(f"向审批员 {admin_id} 发送通知失败: {e}")
 
         except Exception as e:
             logger.error(f"处理申请时发生意外错误: {e}", exc_info=True)
