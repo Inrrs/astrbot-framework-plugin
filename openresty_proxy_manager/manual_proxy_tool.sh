@@ -180,7 +180,7 @@ do_list() {
             return
         fi
 
-        # 使用更健壮的 awk 状态机来解析
+        # 使用兼容性最强的 POSIX awk 状态机来解析
         awk '
         /^(# Rule ID:|# 手动添加规则)/ {
             header = $0;
@@ -199,13 +199,16 @@ do_list() {
         }
         in_block && /^\}/ {
             if (header ~ /^# Rule ID:/) {
-                match(header, /Rule ID: ([^ |]+)/, arr);
-                rid = arr[1];
+                rid_str = header;
+                sub(/.*Rule ID: /, "", rid_str);
+                sub(/ .*/, "", rid_str);
+                rid = rid_str;
                 printf "  [机器人] 代理: %-25s -> 外网端口: %-5s (ID: %s)\n", lan, wan, rid;
             } else if (header ~ /^# 手动添加规则/) {
-                match(header, /用途: ([^|]+)/, arr);
-                remark = arr[1];
-                gsub(/^[ \t]+|[ \t]+$/, "", remark);
+                remark_str = header;
+                sub(/.*用途: /, "", remark_str);
+                sub(/ *\|.*/, "", remark_str);
+                remark = remark_str;
                 yellow = "\033[1;33m"; nc = "\033[0m";
                 printf "  " yellow "[手动]" nc "   代理: %-25s -> 外网端口: %-5s (用途: %s)\n", lan, wan, remark;
             }
