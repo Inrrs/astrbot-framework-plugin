@@ -173,46 +173,41 @@ EOF
 
 # 查询规则
 do_list() {
+    parse_config_file() {
+        local file_path=$1
+        if [ ! -f "$file_path" ]; then
+            echo "文件不存在或为空。"
+            return
+        fi
+
+        # 使用 grep 和 while read 逐块处理，比 awk 更稳定
+        grep -Ezo "(# rid: [^\n]+|# 手动添加规则 [^\n]+)\nserver\s*\{[^\}]+\}" "$file_path" | while IFS= read -r -d '' block; do
+            # 提取注释头
+            local header=$(echo "$block" | head -n 1)
+            
+            # 提取 listen 端口 (wan_port)
+            local wan_port=$(echo "$block" | grep -oP 'listen\s+\K[0-9]+' | head -n 1)
+            
+            # 提取 proxy_pass 地址 (lan_addr)
+            local lan_addr=$(echo "$block" | grep -oP 'proxy_pass\s+[^;]+' | sed -E 's/proxy_pass\s+(http:\/\/)?//; s/;//')
+
+            if [[ "$header" == *"# rid:"* ]]; then
+                # 机器人规则
+                local rid=$(echo "$header" | grep -oP '# rid: \K[\w-]+')
+                printf "  [机器人] 代理: %-25s -> 外网端口: %-5s (ID: %s)\n" "$lan_addr" "$wan_port" "$rid"
+            elif [[ "$header" == *"# 手动添加规则"* ]]; then
+                # 手动规则
+                local remark=$(echo "$header" | grep -oP '用途: \K[^|]+' | sed 's/ //')
+                printf "  ${YELLOW}[手动]${NC}   代理: %-25s -> 外网端口: %-5s (用途: %s)\n" "$lan_addr" "$wan_port" "$remark"
+            fi
+        done
+    }
+
     echo -e "${GREEN}--- HTTP/S 规则 (${HTTP_CONF_PATH}) ---${NC}"
-    if [ -f "$HTTP_CONF_PATH" ]; then
-        # 使用 awk 提取关键信息
-        awk '
-        /<!-- rid:/ {
-            rid=$3; 
-            getline; getline; # skip lines
-            wan_port=$2; gsub(";", "", wan_port);
-            getline; getline; getline; # skip lines
-            lan_addr=$2; gsub(";", "", lan_addr);
-            printf "  [机器人] 代理: %-25s -> 外网端口: %-5s (ID: %s)\n", lan_addr, wan_port, rid;
-        }
-        /# 手动添加规则/ {
-            wan_port=$7; lan_addr=$10; remark=$13;
-            for (i=14; i<=NF-2; i++) remark=remark" "$i;
-            printf "  ${YELLOW}[手动]${NC}   代理: %-25s -> 外网端口: %-5s (用途: %s)\n", lan_addr, wan_port, remark;
-        }' "$HTTP_CONF_PATH"
-    else
-        echo "文件不存在或为空。"
-    fi
+    parse_config_file "$HTTP_CONF_PATH"
 
     echo -e "\n${GREEN}--- TCP/UDP 规则 (${STREAM_CONF_PATH}) ---${NC}"
-    if [ -f "$STREAM_CONF_PATH" ]; then
-        awk '
-        /<!-- rid:/ {
-            rid=$3;
-            getline; getline; # skip lines
-            wan_port=$2; gsub(";", "", wan_port);
-            getline; getline; # skip lines
-            lan_addr=$2; gsub(";", "", lan_addr);
-            printf "  [机器人] 代理: %-25s -> 外网端口: %-5s (ID: %s)\n", lan_addr, wan_port, rid;
-        }
-        /# 手动添加规则/ {
-            wan_port=$7; lan_addr=$10; remark=$13;
-            for (i=14; i<=NF-2; i++) remark=remark" "$i;
-            printf "  ${YELLOW}[手动]${NC}   代理: %-25s -> 外网端口: %-5s (用途: %s)\n", lan_addr, wan_port, remark;
-        }' "$STREAM_CONF_PATH"
-    else
-        echo "文件不存在或为空。"
-    fi
+    parse_config_file "$STREAM_CONF_PATH"
 }
 
 # 删除规则
