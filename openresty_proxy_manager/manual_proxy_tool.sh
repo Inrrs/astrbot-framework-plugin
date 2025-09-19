@@ -175,56 +175,50 @@ EOF
 do_list() {
     parse_config_file() {
         local file_path=$1
-        local is_stream=$2
-
         if [ ! -f "$file_path" ]; then
             echo "文件不存在或为空。"
             return
         fi
 
-        # 使用 awk 逐块处理 server {} 内容
-        awk '/^# (Rule ID|手动添加规则)/,/\}/' "$file_path" | awk -v is_stream="$is_stream" '
-        function print_robot_rule(lan, wan, rid) {
-            printf "  [机器人] 代理: %-25s -> 外网端口: %-5s (ID: %s)\n", lan, wan, rid;
+        # 使用更健壮的 awk 状态机来解析
+        awk '
+        /^(# Rule ID:|# 手动添加规则)/ {
+            header = $0;
+            in_block = 1;
+            lan = wan = rid = remark = "";
         }
-        function print_manual_rule(lan, wan, remark) {
-            yellow = "\033[1;33m"; nc = "\033[0m";
-            printf "  " yellow "[手动]" nc "   代理: %-25s -> 外网端口: %-5s (用途: %s)\n", lan, wan, remark;
-        }
-
-        /^# Rule ID:/ {
-            rid = $4;
-            getline; # Skip comment line if stream
-            if (is_stream && $1 == "#") getline;
-            getline; # server {
-            getline; # listen...
-            wan = $2; gsub(";", "", wan);
-            getline; # proxy_pass...
-            lan = $2; gsub(";", "", lan);
-            if (lan ~ /^http:\/\//) sub("http://", "", lan);
-            print_robot_rule(lan, wan, rid);
-        }
-        /^# 手动添加规则/ {
-            for (i=1; i<=NF; i++) {
-                if ($i == "外网端口:") wan = $(i+1);
-                if ($i == "内网地址:") lan = $(i+1);
-                if ($i == "用途:") {
-                    remark = "";
-                    for (j=i+1; j<=NF; j++) {
-                        if ($j == "|") break;
-                        remark = remark (remark == "" ? "" : " ") $j;
-                    }
-                }
+        in_block && /listen/ {
+            if (wan == "" && match($0, /[0-9]+/)) {
+                wan = substr($0, RSTART, RLENGTH);
             }
-            print_manual_rule(lan, wan, remark);
-        }'
+        }
+        in_block && /proxy_pass/ {
+            lan = $2;
+            sub(/;$/, "", lan);
+            sub(/^http:\/\//, "", lan);
+        }
+        in_block && /^\}/ {
+            if (header ~ /^# Rule ID:/) {
+                match(header, /Rule ID: ([^ |]+)/, arr);
+                rid = arr[1];
+                printf "  [机器人] 代理: %-25s -> 外网端口: %-5s (ID: %s)\n", lan, wan, rid;
+            } else if (header ~ /^# 手动添加规则/) {
+                match(header, /用途: ([^|]+)/, arr);
+                remark = arr[1];
+                gsub(/^[ \t]+|[ \t]+$/, "", remark);
+                yellow = "\033[1;33m"; nc = "\033[0m";
+                printf "  " yellow "[手动]" nc "   代理: %-25s -> 外网端口: %-5s (用途: %s)\n", lan, wan, remark;
+            }
+            in_block = 0;
+        }
+        ' "$file_path"
     }
 
     echo -e "${GREEN}--- HTTP/S 规则 (${HTTP_CONF_PATH}) ---${NC}"
-    parse_config_file "$HTTP_CONF_PATH" "false"
+    parse_config_file "$HTTP_CONF_PATH"
 
     echo -e "\n${GREEN}--- TCP/UDP 规则 (${STREAM_CONF_PATH}) ---${NC}"
-    parse_config_file "$STREAM_CONF_PATH" "true"
+    parse_config_file "$STREAM_CONF_PATH"
 }
 
 # 删除规则
